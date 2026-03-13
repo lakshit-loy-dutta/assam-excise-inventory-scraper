@@ -283,8 +283,8 @@ def normalize(products, tax_table):
 
 def push_to_supabase(companies_df, brands_df, variants_df):
 
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
     if not url or not key:
         raise ValueError(
             "CRITICAL: Supabase URL and Key are missing from environment variables!"
