@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import re
 import hashlib
+import aiohttp
 from bs4 import BeautifulSoup
 from typing import Any, cast, List, Dict
 from dotenv import load_dotenv
@@ -281,7 +282,7 @@ def normalize(products, tax_table):
 # -----------------------
 
 
-def push_to_supabase(companies_df, brands_df, variants_df):
+def push_to_supabase(companies_df, brands_df, variants_df, tax_table_df):
 
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -289,6 +290,16 @@ def push_to_supabase(companies_df, brands_df, variants_df):
         raise ValueError(
             "CRITICAL: Supabase URL and Key are missing from environment variables!"
         )
+
+    # ==========================================
+    # SANITIZE DIRTY GOVERNMENT DATA
+    # Force absolute uniqueness on Primary Keys
+    # ==========================================
+    companies_df = companies_df.drop_duplicates(subset=["id"], keep="last")
+    brands_df = brands_df.drop_duplicates(subset=["id"], keep="last")
+    variants_df = variants_df.drop_duplicates(subset=["id"], keep="last")
+    tax_table_df = tax_table_df.drop_duplicates(subset=["category"], keep="last")
+
     supabase: Client = create_client(url, key)
     # -----------------------------------------
     # 1. UPSERT COMPANIES (Only if new)
@@ -360,3 +371,80 @@ def push_to_supabase(companies_df, brands_df, variants_df):
         supabase.table("global_variants").upsert(clean_push).execute()
     else:
         print("No changes detected in Variants. Database is up to date!")
+
+    # -----------------------------------------
+    # 4. UPSERT TAX RATES (Only if changed)
+    # -----------------------------------------
+    print("Checking Tax Rates for changes...")
+    tax_res = (
+        supabase.table("global_tax_rates")
+        .select("category, excise_per_case, gallonage_fee")
+        .execute()
+    )
+    existing_taxes: list[Any] = tax_res.data
+
+    # Use category as the lookup key
+    tax_lookup = {str(item.get("category")): item for item in existing_taxes}
+
+    taxes_to_push = []
+    tax_records = tax_table_df.to_dict(orient="records")
+
+    for row in tax_records:
+        cat = str(row.get("category"))
+
+        if cat not in tax_lookup:
+            taxes_to_push.append(row)
+        else:
+            old_excise = tax_lookup[cat].get("excise_per_case")
+            old_gal = tax_lookup[cat].get("gallonage_fee")
+
+            new_excise = row.get("excise_per_case")
+            new_gal = row.get("gallonage_fee")
+
+            # If the government changed the rate, push the update!
+            if old_excise != new_excise or old_gal != new_gal:
+                taxes_to_push.append(row)
+
+    if taxes_to_push:
+        print(f"Pushing {len(taxes_to_push)} NEW or UPDATED tax rules...")
+        clean_push = [
+            {k: (None if pd.isna(v) else v) for k, v in item.items()}
+            for item in taxes_to_push
+        ]
+        supabase.table("global_tax_rates").upsert(clean_push).execute()
+    else:
+        print("No changes detected in Tax Rates. Database is up to date!")
+
+
+# -----------------------
+# main pipeline
+# -----------------------
+
+
+def main():
+    session = requests.Session()
+    csrf_name, csrf_value = get_csrf(session)
+    all_rows = []
+    for liquor_type in LIQUOR_TYPES:
+        segments = get_segments(session, csrf_name, csrf_value, liquor_type)
+        print(liquor_type, "segments:", len(segments))
+        for seg in segments:
+            rows = get_prices(session, csrf_name, csrf_value, liquor_type, seg)
+            all_rows.extend(rows)
+    products = pd.DataFrame(all_rows)
+    print("Products scraped:", len(products))
+    products.to_csv("products_raw.csv", index=False)
+    tax_table = scrape_tax_table()
+    companies, brands, variants = normalize(products, tax_table)
+    # companies.to_csv("companies.csv", index=False)
+    # brands.to_csv("brands.csv", index=False)
+    # variants.to_csv("variants.csv", index=False)
+    # tax_table.to_csv("tax_rates.csv", index=False)
+
+    push_to_supabase(companies, brands, variants, tax_table)
+
+    print("Done — normalized datasets pushed to Supabase!")
+
+
+if __name__ == "__main__":
+    main()
