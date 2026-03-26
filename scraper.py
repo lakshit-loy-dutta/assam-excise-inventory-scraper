@@ -16,26 +16,36 @@ SEGMENT_API = f"{BASE}/PriceList/getSegmentDetails"
 PRICE_API = f"{BASE}/PriceList/getPriceList"
 FINANCIAL_YEAR = "2025-2026"
 LIQUOR_TYPES = ["IML", "FL", "BEER", "CS", "HL"]
-MAX_CONCURRENT_REQUESTS = 10
+
+# CRITICAL FIX: Lowered concurrency to avoid triggering the state firewall
+MAX_CONCURRENT_REQUESTS = 2
+
+# CRITICAL FIX: Added a standard browser User-Agent
+STD_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+}
 
 load_dotenv()
+
 
 def hash_id(text):
     return hashlib.md5(text.encode()).hexdigest()
 
+
 def parse_pack(pack):
-    # Added re.IGNORECASE support for 'x' or 'X' with flexible spacing
     m = re.search(r"(\d+)\s*[xX]\s*(\d+)", pack)
     if m:
-        # group(1) = Bottle Size (e.g. 750), group(2) = Case Size (e.g. 12)
         return int(m.group(1)), int(m.group(2))
     return None, None
+
 
 def normalize_company(name):
     name = name.upper()
     name = re.sub(r"TIE-UP HOLDER.*", "", name)
     name = re.sub(r"PVT\.? LTD\.?", "", name)
     return name.strip()
+
 
 def infer_strength(segment):
     spirit_segments = ["Y", "G", "L", "R", "S", "P", "T", "V", "W"]
@@ -47,6 +57,7 @@ def infer_strength(segment):
         return 12
     return None
 
+
 def get_csrf(session):
     r = session.get(PRICE_PAGE)
     soup = BeautifulSoup(r.text, "html.parser")
@@ -56,9 +67,14 @@ def get_csrf(session):
             return str(name), str(inp.get("value"))
     raise Exception("CSRF token not found")
 
+
 def get_segments(session, csrf_name, csrf_value, liquor_type):
     payload = {"type": liquor_type, csrf_name: csrf_value}
-    headers = {"X-Requested-With": "XMLHttpRequest", "Referer": PRICE_PAGE}
+    headers = {
+        **STD_HEADERS,
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": PRICE_PAGE,
+    }
     r = session.post(SEGMENT_API, data=payload, headers=headers)
     data = r.json()
     segments = []
@@ -67,6 +83,7 @@ def get_segments(session, csrf_name, csrf_value, liquor_type):
             {"code": item["CODE"], "name": item["NAME"], "liquor_type": liquor_type}
         )
     return segments
+
 
 async def get_prices_async(
     session, sem, csrf_name, csrf_value, liquor_type, segment_code, segment_name
@@ -78,10 +95,35 @@ async def get_prices_async(
         "liquorType": liquor_type,
         csrf_name: csrf_value,
     }
-    headers = {"X-Requested-With": "XMLHttpRequest", "Referer": PRICE_PAGE}
-    async with sem:
-        async with session.post(PRICE_API, data=payload, headers=headers) as r:
-            text = await r.text()
+    headers = {
+        **STD_HEADERS,
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": PRICE_PAGE,
+    }
+
+    # CRITICAL FIX: Robust retry logic for fragile servers
+    max_retries = 3
+    text = ""
+    for attempt in range(max_retries):
+        try:
+            async with sem:
+                # Be polite to the server
+                await asyncio.sleep(0.5)
+                async with session.post(PRICE_API, data=payload, headers=headers) as r:
+                    r.raise_for_status()
+                    text = await r.text()
+                    break  # Success! Exit the retry loop
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(
+                    f"Failed to fetch {liquor_type} - {segment_name} after {max_retries} attempts: {e}"
+                )
+                return []
+            print(
+                f"Timeout on {segment_name}, retrying... ({attempt + 1}/{max_retries})"
+            )
+            await asyncio.sleep(2)  # Wait a bit before retrying
+
     soup = BeautifulSoup(text, "html.parser")
     rows = []
     for tr in soup.find_all("tr"):
@@ -106,6 +148,7 @@ async def get_prices_async(
                 }
             )
     return rows
+
 
 def normalize(products):
     companies = {}
@@ -147,13 +190,14 @@ def normalize(products):
         variants_df,
     )
 
+
 def push_to_supabase(companies_df, brands_df, variants_df):
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
     if not url or not key:
         raise ValueError("Supabase credentials missing")
     supabase: Client = create_client(url, key)
-    
+
     companies_df = companies_df.drop_duplicates(subset=["id"])
     brands_df = brands_df.drop_duplicates(subset=["id"])
     variants_df = variants_df.drop_duplicates(subset=["id"])
@@ -165,7 +209,7 @@ def push_to_supabase(companies_df, brands_df, variants_df):
         ]
         return cast(Any, records)
 
-    # 1. Push Companies
+    print("Pushing Companies...")
     comp_res = supabase.table("global_companies").select("id").limit(10000).execute()
     existing_companies = {
         str(row["id"]) for row in cast(List[Dict[str, Any]], comp_res.data)
@@ -175,8 +219,8 @@ def push_to_supabase(companies_df, brands_df, variants_df):
         supabase.table("global_companies").upsert(
             clean_records(new_companies)
         ).execute()
-        
-    # 2. Push Brands
+
+    print("Pushing Brands...")
     brand_res = supabase.table("global_brands").select("id").limit(10000).execute()
     existing_brands = {
         str(row["id"]) for row in cast(List[Dict[str, Any]], brand_res.data)
@@ -184,14 +228,18 @@ def push_to_supabase(companies_df, brands_df, variants_df):
     new_brands = brands_df[~brands_df["id"].isin(existing_brands)]
     if not new_brands.empty:
         supabase.table("global_brands").upsert(clean_records(new_brands)).execute()
-        
-    # 3. Push Variants (With Barcode Protection!)
-    # Fetch mapped_barcode so we don't accidentally overwrite it with NULL during upsert
-    var_res = supabase.table("global_variants").select("id, mrp, mapped_barcode").limit(10000).execute()
+
+    print("Pushing Variants...")
+    var_res = (
+        supabase.table("global_variants")
+        .select("id, mrp, mapped_barcode")
+        .limit(10000)
+        .execute()
+    )
     existing_variants = {
         str(row["id"]): row for row in cast(List[Dict[str, Any]], var_res.data)
     }
-    
+
     variants_to_push = []
     for row in variants_df.to_dict(orient="records"):
         vid = str(row["id"])
@@ -199,34 +247,43 @@ def push_to_supabase(companies_df, brands_df, variants_df):
             variants_to_push.append(row)
         else:
             old_row = cast(Dict[str, Any], existing_variants[vid])
-            # Only push if the MRP changed
-            if old_row.get("mrp") != row.get("mrp"):
-                # CRITICAL: Re-inject the existing barcode into the payload before upserting!
+            if old_row.get("mrp") != row.get("mrp") or old_row.get(
+                "mapped_barcode"
+            ) != row.get("mapped_barcode"):
                 row["mapped_barcode"] = old_row.get("mapped_barcode")
                 variants_to_push.append(row)
-                
+
     if variants_to_push:
-        supabase.table("global_variants").upsert(
-            clean_records(pd.DataFrame(variants_to_push))
-        ).execute()
-        
-    print("Supabase sync complete")
+        # Pushing in smaller chunks just in case Supabase complains about payload size
+        chunk_size = 500
+        for i in range(0, len(variants_to_push), chunk_size):
+            chunk = variants_to_push[i : i + chunk_size]
+            supabase.table("global_variants").upsert(
+                clean_records(pd.DataFrame(chunk))
+            ).execute()
+
+    print("Supabase sync complete! 🎉")
+
 
 async def main_async():
     session = requests.Session()
+    session.headers.update(STD_HEADERS)
+
     csrf_name, csrf_value = get_csrf(session)
-    
-    # CRITICAL FIX: Extract the PHP Session cookies from the synchronous request
     site_cookies = session.cookies.get_dict()
-    
+
     sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     tasks = []
-    
-    # INJECT the cookies into the async session so the server accepts the requests
-    async with aiohttp.ClientSession(cookies=site_cookies) as async_session:
+
+    # CRITICAL FIX: Extend aiohttp timeout to 90 seconds
+    timeout = aiohttp.ClientTimeout(total=90)
+
+    async with aiohttp.ClientSession(
+        cookies=site_cookies, headers=STD_HEADERS, timeout=timeout
+    ) as async_session:
         for liquor_type in LIQUOR_TYPES:
             segments = get_segments(session, csrf_name, csrf_value, liquor_type)
-            print(liquor_type, "segments:", len(segments))
+            print(f"Found {len(segments)} segments for {liquor_type}")
             for seg in segments:
                 tasks.append(
                     get_prices_async(
@@ -239,18 +296,25 @@ async def main_async():
                         seg["name"],
                     )
                 )
+        print(f"Executing {len(tasks)} requests to the State Portal...")
         results = await asyncio.gather(*tasks)
-        
+
     all_rows = []
     for r in results:
         all_rows.extend(r)
-        
+
     products = pd.DataFrame(all_rows)
-    print("Products scraped:", len(products))
-    products.to_csv("products_raw.csv", index=False)
-    companies, brands, variants = normalize(products)
-    push_to_supabase(companies, brands, variants)
-    print("Done — normalized datasets pushed to Supabase!")
+    print("Products scraped successfully:", len(products))
+
+    if len(products) > 0:
+        products.to_csv("products_raw.csv", index=False)
+        companies, brands, variants = normalize(products)
+        push_to_supabase(companies, brands, variants)
+    else:
+        print(
+            "Warning: No products found. Check your network or the state portal's status."
+        )
+
 
 if __name__ == "__main__":
     asyncio.run(main_async())
