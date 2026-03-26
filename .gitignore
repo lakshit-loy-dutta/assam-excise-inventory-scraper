@@ -14,3 +14,5 @@ __pycache__/
 
 # Scraper data outputs
 *.csv
+
+notes.txt

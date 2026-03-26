@@ -20,24 +20,22 @@ MAX_CONCURRENT_REQUESTS = 10
 
 load_dotenv()
 
-
 def hash_id(text):
     return hashlib.md5(text.encode()).hexdigest()
 
-
 def parse_pack(pack):
-    m = re.search(r"(\d+)\s*X\s*(\d+)", pack)
+    # Added re.IGNORECASE support for 'x' or 'X' with flexible spacing
+    m = re.search(r"(\d+)\s*[xX]\s*(\d+)", pack)
     if m:
+        # group(1) = Bottle Size (e.g. 750), group(2) = Case Size (e.g. 12)
         return int(m.group(1)), int(m.group(2))
     return None, None
-
 
 def normalize_company(name):
     name = name.upper()
     name = re.sub(r"TIE-UP HOLDER.*", "", name)
     name = re.sub(r"PVT\.? LTD\.?", "", name)
     return name.strip()
-
 
 def infer_strength(segment):
     spirit_segments = ["Y", "G", "L", "R", "S", "P", "T", "V", "W"]
@@ -49,7 +47,6 @@ def infer_strength(segment):
         return 12
     return None
 
-
 def get_csrf(session):
     r = session.get(PRICE_PAGE)
     soup = BeautifulSoup(r.text, "html.parser")
@@ -58,7 +55,6 @@ def get_csrf(session):
         if name and str(name).startswith("csrf"):
             return str(name), str(inp.get("value"))
     raise Exception("CSRF token not found")
-
 
 def get_segments(session, csrf_name, csrf_value, liquor_type):
     payload = {"type": liquor_type, csrf_name: csrf_value}
@@ -71,7 +67,6 @@ def get_segments(session, csrf_name, csrf_value, liquor_type):
             {"code": item["CODE"], "name": item["NAME"], "liquor_type": liquor_type}
         )
     return segments
-
 
 async def get_prices_async(
     session, sem, csrf_name, csrf_value, liquor_type, segment_code, segment_name
@@ -111,7 +106,6 @@ async def get_prices_async(
                 }
             )
     return rows
-
 
 def normalize(products):
     companies = {}
@@ -153,13 +147,13 @@ def normalize(products):
         variants_df,
     )
 
-
 def push_to_supabase(companies_df, brands_df, variants_df):
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
     if not url or not key:
         raise ValueError("Supabase credentials missing")
     supabase: Client = create_client(url, key)
+    
     companies_df = companies_df.drop_duplicates(subset=["id"])
     brands_df = brands_df.drop_duplicates(subset=["id"])
     variants_df = variants_df.drop_duplicates(subset=["id"])
@@ -171,6 +165,7 @@ def push_to_supabase(companies_df, brands_df, variants_df):
         ]
         return cast(Any, records)
 
+    # 1. Push Companies
     comp_res = supabase.table("global_companies").select("id").limit(10000).execute()
     existing_companies = {
         str(row["id"]) for row in cast(List[Dict[str, Any]], comp_res.data)
@@ -180,6 +175,8 @@ def push_to_supabase(companies_df, brands_df, variants_df):
         supabase.table("global_companies").upsert(
             clean_records(new_companies)
         ).execute()
+        
+    # 2. Push Brands
     brand_res = supabase.table("global_brands").select("id").limit(10000).execute()
     existing_brands = {
         str(row["id"]) for row in cast(List[Dict[str, Any]], brand_res.data)
@@ -187,10 +184,14 @@ def push_to_supabase(companies_df, brands_df, variants_df):
     new_brands = brands_df[~brands_df["id"].isin(existing_brands)]
     if not new_brands.empty:
         supabase.table("global_brands").upsert(clean_records(new_brands)).execute()
-    var_res = supabase.table("global_variants").select("id, mrp").limit(10000).execute()
+        
+    # 3. Push Variants (With Barcode Protection!)
+    # Fetch mapped_barcode so we don't accidentally overwrite it with NULL during upsert
+    var_res = supabase.table("global_variants").select("id, mrp, mapped_barcode").limit(10000).execute()
     existing_variants = {
         str(row["id"]): row for row in cast(List[Dict[str, Any]], var_res.data)
     }
+    
     variants_to_push = []
     for row in variants_df.to_dict(orient="records"):
         vid = str(row["id"])
@@ -198,21 +199,31 @@ def push_to_supabase(companies_df, brands_df, variants_df):
             variants_to_push.append(row)
         else:
             old_row = cast(Dict[str, Any], existing_variants[vid])
+            # Only push if the MRP changed
             if old_row.get("mrp") != row.get("mrp"):
+                # CRITICAL: Re-inject the existing barcode into the payload before upserting!
+                row["mapped_barcode"] = old_row.get("mapped_barcode")
                 variants_to_push.append(row)
+                
     if variants_to_push:
         supabase.table("global_variants").upsert(
             clean_records(pd.DataFrame(variants_to_push))
         ).execute()
+        
     print("Supabase sync complete")
-
 
 async def main_async():
     session = requests.Session()
     csrf_name, csrf_value = get_csrf(session)
+    
+    # CRITICAL FIX: Extract the PHP Session cookies from the synchronous request
+    site_cookies = session.cookies.get_dict()
+    
     sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     tasks = []
-    async with aiohttp.ClientSession() as async_session:
+    
+    # INJECT the cookies into the async session so the server accepts the requests
+    async with aiohttp.ClientSession(cookies=site_cookies) as async_session:
         for liquor_type in LIQUOR_TYPES:
             segments = get_segments(session, csrf_name, csrf_value, liquor_type)
             print(liquor_type, "segments:", len(segments))
@@ -229,16 +240,17 @@ async def main_async():
                     )
                 )
         results = await asyncio.gather(*tasks)
+        
     all_rows = []
     for r in results:
         all_rows.extend(r)
+        
     products = pd.DataFrame(all_rows)
     print("Products scraped:", len(products))
     products.to_csv("products_raw.csv", index=False)
     companies, brands, variants = normalize(products)
     push_to_supabase(companies, brands, variants)
     print("Done — normalized datasets pushed to Supabase!")
-
 
 if __name__ == "__main__":
     asyncio.run(main_async())
